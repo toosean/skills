@@ -1,0 +1,4 @@
+interface:
+  display_name: "兔子nano"
+  short_description: "根据中文或英文提示词调用兔子异步接口生成图片并返回结果"
+  default_prompt: "Use $tu-zi-nano to generate an image from this prompt: 一只坐在月球上的白兔，电影感，1:1。"

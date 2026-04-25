@@ -1,0 +1,4 @@
+interface:
+  display_name: "Apimart Image Generation"
+  short_description: "调用 Apimart 异步接口生成图片并自动轮询结果"
+  default_prompt: "Use $apimart-image-generation to generate an image from this prompt and any local or public reference images I provide."

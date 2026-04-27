@@ -17,6 +17,11 @@
 
 ## Structure
 
+- When `--title` is provided, insert a first-page cover before the TOC and body content.
+- Put the provided title as the main cover text in the middle area of the page.
+- Do not add a separate top title, year line, or `封` / `面` placeholder text.
+- Put `编制单位：...` near the lower center when an `author` value exists in Markdown front matter.
+- Put `编制日期：YYYY年M月D日` near the lower center using the conversion date.
 - Insert a Word table-of-contents field near the beginning when TOC is enabled.
 - Keep TOC level 1 aligned to the document text area, indent deeper TOC levels modestly, and use right-aligned dotted page-number tabs.
 - Normalize the shallowest Markdown heading level to Word Heading 1 so top-level TOC entries are not accidentally indented.

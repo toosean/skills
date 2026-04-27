@@ -9,6 +9,7 @@ import json
 import sys
 import unicodedata
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 from urllib.error import HTTPError, URLError
@@ -322,6 +323,37 @@ def add_toc_field(document: Document, depth: int) -> None:
     final_run._r.append(end)
     document.add_paragraph()
     add_update_fields_setting(document)
+
+
+def format_chinese_date(value: date) -> str:
+    return f"{value.year}年{value.month}月{value.day}日"
+
+
+def add_centered_paragraph(document: Document, text: str = "", *, size: int = 12, bold: bool = False):
+    paragraph = document.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.first_line_indent = Pt(0)
+    run = paragraph.add_run(text)
+    run.bold = bold
+    run.font.size = Pt(size)
+    set_run_east_asia_font(run, BODY_EAST_ASIA_FONT, BODY_LATIN_FONT)
+    return paragraph
+
+
+def add_cover_page(document: Document, title: str, *, compile_unit: str | None = None) -> None:
+    document.core_properties.title = title
+
+    title_paragraph = add_centered_paragraph(document, title, size=24, bold=True)
+    title_paragraph.paragraph_format.space_before = Pt(250)
+    title_paragraph.paragraph_format.space_after = Pt(190)
+
+    if compile_unit:
+        unit_paragraph = add_centered_paragraph(document, f"编制单位：{compile_unit}", size=11, bold=True)
+        unit_paragraph.paragraph_format.space_after = Pt(8)
+    date_paragraph = add_centered_paragraph(document, f"编制日期：{format_chinese_date(date.today())}", size=11, bold=True)
+    date_paragraph.paragraph_format.space_after = Pt(0)
+
+    document.add_page_break()
 
 
 def apply_formal_zh_defaults(document: Document) -> None:
@@ -927,6 +959,7 @@ def convert_markdown(
     number_headings: bool = True,
     toc_depth: int = 3,
     resource_paths: Iterable[Path] | None = None,
+    cover_title: str | None = None,
 ) -> dict[str, object]:
     if format_name != "formal-zh":
         raise ValueError(f"Unsupported format: {format_name}")
@@ -942,7 +975,10 @@ def convert_markdown(
 
     document = Document()
     apply_formal_zh_defaults(document)
-    add_metadata(document, metadata)
+    if cover_title:
+        add_cover_page(document, cover_title, compile_unit=metadata.get("author"))
+    else:
+        add_metadata(document, metadata)
     if toc:
         add_toc_field(document, toc_depth)
 
@@ -969,6 +1005,7 @@ def convert_markdown(
         "toc": toc,
         "number_headings": number_headings,
         "toc_depth": toc_depth,
+        "cover_title": cover_title,
         "heading_level_offset": heading_offset,
         "warnings": renderer.warnings,
     }
@@ -981,6 +1018,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     convert = subparsers.add_parser("convert", help="Convert a Markdown file to .docx.")
     convert.add_argument("input", help="Path to the input .md file.")
     convert.add_argument("--output", "-o", required=True, help="Path to the output .docx file.")
+    convert.add_argument("--title", help="Document title to place on a generated formal cover page.")
     convert.add_argument("--format", default="formal-zh", choices=["formal-zh"], help="Built-in output format.")
     toc_group = convert.add_mutually_exclusive_group()
     toc_group.add_argument("--toc", dest="toc", action="store_true", default=True, help="Insert a Word TOC field.")
@@ -1027,6 +1065,7 @@ def main(argv: list[str] | None = None) -> int:
                 number_headings=args.number_headings,
                 toc_depth=args.toc_depth,
                 resource_paths=resource_paths,
+                cover_title=args.title.strip() if args.title and args.title.strip() else None,
             )
         else:  # pragma: no cover - argparse prevents this path
             parser.error(f"Unknown command: {args.command}")

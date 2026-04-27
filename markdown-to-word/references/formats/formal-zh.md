@@ -18,6 +18,8 @@
 ## Structure
 
 - Insert a Word table-of-contents field near the beginning when TOC is enabled.
+- Keep TOC level 1 aligned to the document text area, indent deeper TOC levels modestly, and use right-aligned dotted page-number tabs.
+- Normalize the shallowest Markdown heading level to Word Heading 1 so top-level TOC entries are not accidentally indented.
 - Number headings by default.
 - Preserve Markdown hierarchy through Word heading styles.
 - Keep metadata such as title, author, and date at the beginning of the document when provided in YAML front matter.
@@ -28,4 +30,6 @@
 - Render fenced code blocks with monospace text and light shading.
 - Render blockquotes as indented muted text.
 - Render links as clickable Word hyperlinks.
-- Insert local images when they can be resolved from the Markdown file directory or `--resource-path`.
+- Insert local images when they can be resolved from the Markdown file's absolute directory or `--resource-path`.
+- Decode percent-encoded local image paths before resolving them on disk.
+- Download and embed remote HTTP/HTTPS images when referenced by Markdown image syntax.

@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
-import re
 import sys
-from copy import copy
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlparse
+from urllib.request import Request, urlopen
 
 try:
     from markdown_it import MarkdownIt
@@ -23,7 +26,7 @@ try:
     from docx import Document
     from docx.enum.style import WD_STYLE_TYPE
     from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
-    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_TAB_ALIGNMENT, WD_TAB_LEADER
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.opc.constants import RELATIONSHIP_TYPE as RT
@@ -39,6 +42,9 @@ BODY_LATIN_FONT = "Times New Roman"
 HEADING_EAST_ASIA_FONT = "SimHei"
 CODE_FONT = "Consolas"
 MAX_IMAGE_WIDTH = Inches(5.8)
+MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024
+REMOTE_IMAGE_TIMEOUT_SECONDS = 20
+REMOTE_IMAGE_USER_AGENT = "markdown-to-word/1.0"
 
 
 @dataclass
@@ -68,6 +74,28 @@ def clone_inline_state(state: InlineState) -> InlineState:
 def attr_get(token, name: str, default: str | None = None) -> str | None:
     value = token.attrGet(name)
     return value if value is not None else default
+
+
+def clean_cli_path(value: str | Path) -> Path:
+    text = str(value)
+    cleaned = "".join(char for char in text if unicodedata.category(char) != "Cf").strip()
+    return Path(cleaned)
+
+
+def is_windows_absolute_path_text(value: str) -> bool:
+    return (
+        len(value) >= 3
+        and value[0].isalpha()
+        and value[1] == ":"
+        and value[2] in {"\\", "/"}
+    ) or value.startswith("\\\\")
+
+
+def normalize_local_path_text(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 4 and text[0] == "/" and text[1].isalpha() and text[2] == ":":
+        return text[1:]
+    return text
 
 
 def parse_front_matter(markdown: str) -> tuple[dict[str, str], str]:
@@ -120,6 +148,19 @@ def get_or_add_paragraph_style(document: Document, name: str, base: str = "Norma
         if base in styles:
             style.base_style = styles[base]
         return style
+
+
+def get_or_add_child(parent, tag: str):
+    child = parent.find(qn(tag))
+    if child is None:
+        child = OxmlElement(tag)
+        parent.append(child)
+    return child
+
+
+def remove_children(parent, tag: str) -> None:
+    for child in list(parent.findall(qn(tag))):
+        parent.remove(child)
 
 
 def set_run_east_asia_font(run_or_font, east_asia: str, ascii_font: str | None = None) -> None:
@@ -237,11 +278,22 @@ def add_update_fields_setting(document: Document) -> None:
     settings.append(update_fields)
 
 
+def set_paragraph_style_id(paragraph, style_id: str) -> None:
+    ppr = paragraph._p.get_or_add_pPr()
+    pstyle = ppr.find(qn("w:pStyle"))
+    if pstyle is None:
+        pstyle = OxmlElement("w:pStyle")
+        ppr.insert(0, pstyle)
+    pstyle.set(qn("w:val"), style_id)
+
+
 def add_toc_field(document: Document, depth: int) -> None:
     title = document.add_paragraph("目录", style="TOC Title")
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     paragraph = document.add_paragraph()
+    set_paragraph_style_id(paragraph, "TOC1")
+    paragraph.paragraph_format.first_line_indent = Pt(0)
     run = paragraph.add_run()
 
     begin = OxmlElement("w:fldChar")
@@ -308,6 +360,7 @@ def apply_formal_zh_defaults(document: Document) -> None:
     set_style_font(toc_title, HEADING_EAST_ASIA_FONT, BODY_LATIN_FONT, Pt(16), bold=True)
     toc_title.paragraph_format.first_line_indent = Pt(0)
     toc_title.paragraph_format.space_after = Pt(10)
+    configure_toc_styles(document)
 
     quote = get_or_add_paragraph_style(document, "Markdown Quote")
     set_style_font(quote, BODY_EAST_ASIA_FONT, BODY_LATIN_FONT, Pt(11), italic=False, color=RGBColor(80, 80, 80))
@@ -335,6 +388,45 @@ def apply_formal_zh_defaults(document: Document) -> None:
     ):
         if style_exists(document, style_name):
             set_style_font(document.styles[style_name], BODY_EAST_ASIA_FONT, BODY_LATIN_FONT, Pt(12))
+
+
+def configure_toc_styles(document: Document) -> None:
+    section = document.sections[0]
+    content_width = section.page_width - section.left_margin - section.right_margin
+
+    for level in range(1, 7):
+        style = get_or_add_paragraph_style(document, f"TOC {level}")
+        style_element = style._element
+        style_element.set(qn("w:styleId"), f"TOC{level}")
+        style_element.attrib.pop(qn("w:customStyle"), None)
+        remove_children(style_element, "w:basedOn")
+        name = get_or_add_child(style_element, "w:name")
+        name.set(qn("w:val"), f"toc {level}")
+        ui_priority = get_or_add_child(style_element, "w:uiPriority")
+        ui_priority.set(qn("w:val"), str(39 + level))
+        get_or_add_child(style_element, "w:unhideWhenUsed")
+
+        set_style_font(style, BODY_EAST_ASIA_FONT, BODY_LATIN_FONT, Pt(11))
+        paragraph_format = style.paragraph_format
+        paragraph_format.first_line_indent = Pt(0)
+        paragraph_format.left_indent = Cm((level - 1) * 0.74)
+        paragraph_format.right_indent = Pt(0)
+        paragraph_format.space_before = Pt(0)
+        paragraph_format.space_after = Pt(4)
+        paragraph_format.line_spacing = 1.15
+        paragraph_format.tab_stops.clear_all()
+        paragraph_format.tab_stops.add_tab_stop(
+            content_width,
+            WD_TAB_ALIGNMENT.RIGHT,
+            WD_TAB_LEADER.DOTS,
+        )
+
+        ppr = style_element.get_or_add_pPr()
+        ind = get_or_add_child(ppr, "w:ind")
+        ind.set(qn("w:left"), str(int(Cm((level - 1) * 0.74).twips)))
+        ind.set(qn("w:firstLine"), "0")
+        if qn("w:hanging") in ind.attrib:
+            del ind.attrib[qn("w:hanging")]
 
 
 def list_style_name(document: Document, ordered: bool, level: int) -> str:
@@ -393,13 +485,19 @@ class MarkdownDocxRenderer:
         input_path: Path,
         resource_paths: Iterable[Path] | None = None,
         number_headings: bool = True,
+        heading_level_offset: int = 0,
     ) -> None:
         self.document = document
-        self.input_path = input_path
-        self.resource_paths = [input_path.parent]
+        self.input_path = input_path.resolve()
+        self.resource_paths = [self.input_path.parent]
         if resource_paths:
-            self.resource_paths.extend(resource_paths)
+            for resource_path in resource_paths:
+                if resource_path.is_absolute():
+                    self.resource_paths.append(resource_path)
+                else:
+                    self.resource_paths.append((self.input_path.parent / resource_path).resolve())
         self.number_headings = number_headings
+        self.heading_level_offset = heading_level_offset
         self.heading_counters = [0, 0, 0, 0, 0, 0]
         self.warnings: list[str] = []
 
@@ -445,7 +543,8 @@ class MarkdownDocxRenderer:
 
     def render_heading(self, tokens, index: int) -> int:
         token = tokens[index]
-        level = int(token.tag[1]) if token.tag and token.tag.startswith("h") else 1
+        markdown_level = int(token.tag[1]) if token.tag and token.tag.startswith("h") else 1
+        level = max(1, min(6, markdown_level - self.heading_level_offset))
         inline = tokens[index + 1] if index + 1 < len(tokens) and tokens[index + 1].type == "inline" else None
         text_prefix = ""
         if self.number_headings:
@@ -606,23 +705,50 @@ class MarkdownDocxRenderer:
             self.add_text(paragraph, f"[image: {alt}]", InlineState())
             return
 
-        image_path = self.resolve_image_path(src)
-        if image_path is None:
+        image_source = self.resolve_image_source(src)
+        if image_source is None:
             self.warnings.append(f"Image not found: {src}")
             self.add_text(paragraph, f"[image not found: {alt}]", InlineState(italic=True))
             return
 
         try:
             run = paragraph.add_run()
-            run.add_picture(str(image_path), width=MAX_IMAGE_WIDTH)
+            if isinstance(image_source, Path):
+                run.add_picture(str(image_source), width=MAX_IMAGE_WIDTH)
+            else:
+                image_source.seek(0)
+                run.add_picture(image_source, width=MAX_IMAGE_WIDTH)
         except Exception as exc:  # pragma: no cover - depends on image codec support
             self.warnings.append(f"Could not insert image {src}: {exc}")
             self.add_text(paragraph, f"[image could not be inserted: {alt}]", InlineState(italic=True))
 
-    def resolve_image_path(self, src: str) -> Path | None:
-        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", src):
-            self.warnings.append(f"Remote image skipped: {src}")
+    def resolve_image_source(self, src: str) -> Path | io.BytesIO | None:
+        src = src.strip()
+        decoded_src = normalize_local_path_text(unquote(src))
+        if is_windows_absolute_path_text(src) or is_windows_absolute_path_text(decoded_src):
+            return self.resolve_local_image_path(decoded_src)
+
+        parsed = urlparse(src)
+        if parsed.scheme in {"http", "https"}:
+            return self.download_remote_image(src)
+        if parsed.scheme == "file":
+            file_path = normalize_local_path_text(unquote(parsed.path))
+            if parsed.netloc:
+                file_path = f"//{parsed.netloc}{file_path}"
+            return self.resolve_local_image_path(file_path)
+        if parsed.scheme:
+            self.warnings.append(f"Unsupported image URI scheme: {parsed.scheme}")
             return None
+        local_candidates = [decoded_src]
+        if parsed.path:
+            local_candidates.append(normalize_local_path_text(unquote(parsed.path)))
+        for local_src in dict.fromkeys(local_candidates):
+            resolved = self.resolve_local_image_path(local_src)
+            if resolved is not None:
+                return resolved
+        return None
+
+    def resolve_local_image_path(self, src: str) -> Path | None:
         candidate = Path(src)
         if candidate.is_absolute() and candidate.exists():
             return candidate
@@ -631,6 +757,38 @@ class MarkdownDocxRenderer:
             if resolved.exists():
                 return resolved
         return None
+
+    def download_remote_image(self, src: str) -> io.BytesIO | None:
+        request = Request(src, headers={"User-Agent": REMOTE_IMAGE_USER_AGENT})
+        try:
+            with urlopen(request, timeout=REMOTE_IMAGE_TIMEOUT_SECONDS) as response:
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > MAX_REMOTE_IMAGE_BYTES:
+                    self.warnings.append(
+                        f"Remote image too large ({content_length} bytes, max {MAX_REMOTE_IMAGE_BYTES}): {src}"
+                    )
+                    return None
+
+                data = bytearray()
+                while True:
+                    chunk = response.read(1024 * 64)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    if len(data) > MAX_REMOTE_IMAGE_BYTES:
+                        self.warnings.append(
+                            f"Remote image too large (over {MAX_REMOTE_IMAGE_BYTES} bytes): {src}"
+                        )
+                        return None
+
+                content_type = response.headers.get("Content-Type", "")
+                if content_type and not content_type.lower().startswith("image/"):
+                    self.warnings.append(f"Remote URL did not return an image content type ({content_type}): {src}")
+
+                return io.BytesIO(bytes(data))
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            self.warnings.append(f"Could not download remote image {src}: {exc}")
+            return None
 
     def add_code_block(self, content: str) -> None:
         lines = content.splitlines() or [""]
@@ -725,6 +883,17 @@ def build_markdown_parser() -> MarkdownIt:
     return parser
 
 
+def heading_level_offset(tokens) -> int:
+    levels = [
+        int(token.tag[1])
+        for token in tokens
+        if token.type == "heading_open" and token.tag and token.tag.startswith("h") and token.tag[1:].isdigit()
+    ]
+    if not levels:
+        return 0
+    return max(0, min(levels) - 1)
+
+
 def add_metadata(document: Document, metadata: dict[str, str]) -> None:
     title = metadata.get("title")
     if title:
@@ -779,11 +948,13 @@ def convert_markdown(
 
     parser = build_markdown_parser()
     tokens = parser.parse(body)
+    heading_offset = heading_level_offset(tokens)
     renderer = MarkdownDocxRenderer(
         document,
         input_path=input_path,
         resource_paths=resource_paths,
         number_headings=number_headings,
+        heading_level_offset=heading_offset,
     )
     renderer.render(tokens)
 
@@ -798,6 +969,7 @@ def convert_markdown(
         "toc": toc,
         "number_headings": number_headings,
         "toc_depth": toc_depth,
+        "heading_level_offset": heading_offset,
         "warnings": renderer.warnings,
     }
 
@@ -807,8 +979,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     convert = subparsers.add_parser("convert", help="Convert a Markdown file to .docx.")
-    convert.add_argument("input", type=Path, help="Path to the input .md file.")
-    convert.add_argument("--output", "-o", type=Path, required=True, help="Path to the output .docx file.")
+    convert.add_argument("input", help="Path to the input .md file.")
+    convert.add_argument("--output", "-o", required=True, help="Path to the output .docx file.")
     convert.add_argument("--format", default="formal-zh", choices=["formal-zh"], help="Built-in output format.")
     toc_group = convert.add_mutually_exclusive_group()
     toc_group.add_argument("--toc", dest="toc", action="store_true", default=True, help="Insert a Word TOC field.")
@@ -830,7 +1002,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     convert.add_argument("--toc-depth", type=int, default=3, help="Maximum heading depth included in the TOC field.")
     convert.add_argument(
         "--resource-path",
-        type=Path,
         action="append",
         default=[],
         help="Additional directory to search for relative image paths. Repeatable.",
@@ -845,9 +1016,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "convert":
-            input_path = args.input.resolve()
-            output_path = args.output.resolve()
-            resource_paths = [path.resolve() for path in args.resource_path]
+            input_path = clean_cli_path(args.input).resolve()
+            output_path = clean_cli_path(args.output).resolve()
+            resource_paths = [clean_cli_path(path) for path in args.resource_path]
             result = convert_markdown(
                 input_path,
                 output_path,

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Markdown To Word"
+  short_description: "Convert Markdown into formal Word documents"
+  default_prompt: "Use $markdown-to-word to convert this Markdown file into a formal Chinese Word document."

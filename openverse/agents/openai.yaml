@@ -1,0 +1,4 @@
+interface:
+  display_name: "Openverse"
+  short_description: "Search licensed images and audio"
+  default_prompt: "Use $openverse to search Openverse for licensed image or audio assets."
